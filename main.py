@@ -141,7 +141,7 @@ def telegram_webhook():
         memo["date"] = today; memo["coupons_jour"] = 0; local_save(memo)
     if txt == "/stats":
         tot = memo['gagnants'] + memo['perdants']
-        tx = round((memo['gagnants']/tot)*100, 1) if tot > 0 else 0)
+        tx = round((memo['gagnants']/tot)*100, 1) if tot > 0 else 0
         tg(f"📊 <b>BILAN</b>\n✅ G: {memo['gagnants']}\n❌ P: {memo['perdants']}\n📈 Réussite: {tx}%\n🔄 {tot}/50\n📆 Jour: {memo['coupons_jour']}/5")
     elif txt == "/win":
         memo['gagnants'] += 1; local_save(memo); log_to_google_sheet("GAIN"); tg("✅ OPTION VALIDÉE EN GAIN!")
