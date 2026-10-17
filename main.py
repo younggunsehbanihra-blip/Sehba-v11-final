@@ -7,15 +7,15 @@ import time
 from flask import Flask, request
 from groq import Groq
 
-# Configuration avec tes clés d'origine - CORRIGE SEULEMENT SHEET ID
-GROQ_API_KEY = "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"
-TELEGRAM_TOKEN = "8631670973:AAHqmUWGKKr1dNeNO6fLOXwfngjygClOEqA"
-TELEGRAM_CHAT_ID = "8851728637"
-ODDS_API_KEY = "a466f43991f4602462ade9c258464e72"
-RAPIDAPI_KEY = "3f38adafd5msh4156e2331c2667fp17307ejsn5fa6a32beecb"
-GOOGLE_SHEET_ID = "1YE3nB5AOI8mIITdKgHQALFEdxHYpTh9hPNJ0Fp0al60"
+# --- VERSION PROPRE - LECTURE DEPUIS ENVIRONMENT ---
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+FICHIER_STATS = os.getenv("FICHIER_STATS", "/tmp/stats.json")
 
-FICHIER_STATS = "/tmp/stats.json"
 app = Flask(__name__)
 
 def local_load():
@@ -121,12 +121,11 @@ def keep_alive():
 threading.Thread(target=keep_alive, daemon=True).start()
 
 @app.route('/')
-def home_page(): return "SERVEUR SEHBA V19 OPERATIONNEL", 200
+def home_page(): return "SERVEUR SEHBA V19 OPERATIONNEL - ENV OK", 200
 
-# --- SEULE AJOUTE : CLE RUN POUR LANCEMENT ---
 @app.route('/run')
 def run_lancement():
-    tg("🎉 <b>SEHBA V19 LANCÉ AVEC SUCCÈS - MAROUA</b>\n\n✅ Serveur opérationnel\n✅ Telegram connecté\n✅ Render connecté\n\nSystème prêt. Envoie /analyse pour tester.")
+    tg("🎉 <b>SEHBA V19 LANCÉ AVEC SUCCÈS - MAROUA</b>\n\n✅ Serveur opérationnel\n✅ Telegram connecté via Environment\n✅ Render connecté\n\nSystème prêt. Envoie /analyse pour tester.")
     return "INAUGURATION V19 FAITE - VA VOIR TELEGRAM", 200
 
 @app.route('/webhook', methods=['POST'])
@@ -142,7 +141,7 @@ def telegram_webhook():
         memo["date"] = today; memo["coupons_jour"] = 0; local_save(memo)
     if txt == "/stats":
         tot = memo['gagnants'] + memo['perdants']
-        tx = round((memo['gagnants']/tot)*100, 1) if tot > 0 else 0
+        tx = round((memo['gagnants']/tot)*100, 1) if tot > 0 else 0)
         tg(f"📊 <b>BILAN</b>\n✅ G: {memo['gagnants']}\n❌ P: {memo['perdants']}\n📈 Réussite: {tx}%\n🔄 {tot}/50\n📆 Jour: {memo['coupons_jour']}/5")
     elif txt == "/win":
         memo['gagnants'] += 1; local_save(memo); log_to_google_sheet("GAIN"); tg("✅ OPTION VALIDÉE EN GAIN!")
