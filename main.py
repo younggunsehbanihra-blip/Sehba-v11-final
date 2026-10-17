@@ -321,7 +321,7 @@ def telegram_webhook():
         memo = local_load()
         if txt.lower() == "/stats":
             tot = int(memo.get('gagnants', 0)) + int(memo.get('perdants', 0))
-            tx = round((int(memo.get('gagnants', 0))/tot)*100, 1) if tot > 0 else 0, 1)
+            tx = round((int(memo.get('gagnants', 0))/tot)*100, 1) if tot > 0 else 0
             tg(f"📊 <b>BILAN EXPERT HYBRIDE</b>\n✅ G: {memo.get('gagnants')}\n❌ P: {memo.get('perdants')}\n📈 Réussite: {tx}%\n📆 Coupons Auto Jour: {memo.get('coupons_jour')}/5")
         elif txt.lower() == "/win":
             memo['gagnants'] = int(memo.get('gagnants', 0)) + 1
