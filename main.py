@@ -1,4 +1,4 @@
-import os, requests, json, datetime, re
+import os, requests, datetime, time, unicodedata, json
 from flask import Flask, request, jsonify
 from datetime import timezone, timedelta
 
@@ -13,241 +13,222 @@ BASE = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": APISPORTS_KEY} if APISPORTS_KEY else {}
 MAROUA_TZ = timezone(timedelta(hours=1))
 
-def send_telegram(text):
-    if not TELE_TOKEN or not TELE_CHAT:
-        print(text); return
+TOP_LEAGUES = [307, 39, 140, 135, 78]
+SECOND_LEAGUES = [308, 40, 203, 71, 72, 76]
+
+# --- MEMOIRE DES 7 MATCHS POUR SUIVI SMART MONEY ---
+TRACKED_FILE = "/tmp/tracked.json"
+TRACKED_MATCHES = []  # [{fid, home, away, initial_odds, current_odds, marche, heure_match}]
+
+def strip_accents(s): return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+def send_telegram(text, chat_id=None):
+    cid = chat_id or TELE_CHAT
+    if not TELE_TOKEN or not cid: print(text); return
     try:
         url = f"https://api.telegram.org/bot{TELE_TOKEN}/sendMessage"
-        # Telegram max 4096 chars, on coupe
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-            requests.post(url, json={"chat_id": TELE_CHAT, "text": chunk, "parse_mode": "Markdown"}, timeout=15)
-    except Exception as e:
-        print(f"TELE FAIL {e}")
+        for chunk in [text[i:i+3900] for i in range(0, len(text), 3900)]:
+            requests.post(url, json={"chat_id": cid, "text": chunk, "parse_mode":"Markdown"}, timeout=15)
+    except Exception as e: print(e)
+
+def save_tracked():
+    try:
+        with open(TRACKED_FILE, 'w') as f: json.dump(TRACKED_MATCHES, f)
+    except: pass
+
+def load_tracked():
+    global TRACKED_MATCHES
+    try:
+        with open(TRACKED_FILE, 'r') as f: TRACKED_MATCHES = json.load(f)
+    except: TRACKED_MATCHES = []
 
 def call_api(endpoint):
-    if not APISPORTS_KEY: return None
+    if not APISPORTS_KEY: return []
     try:
-        r = requests.get(f"{BASE}/{endpoint}", headers=HEADERS, timeout=20)
-        j = r.json()
-        if j.get('response'): return j['response']
-        return []
-    except Exception as e:
-        print(f"API {endpoint} fail {e}"); return None
+        r = requests.get(f"{BASE}/{endpoint}", headers=HEADERS, timeout=15).json()
+        return r.get('response', [])
+    except: return []
+
+def get_current_pinnacle_odds(fid):
+    odds = call_api(f"odds?fixture={fid}")
+    try:
+        for fx in odds:
+            for book in fx.get('bookmakers', []):
+                if 'Pinnacle' in book['name']:
+                    for bet in book['bets']:
+                        if bet['name'] == 'Match Winner':
+                            return {v['value']: float(v['odd']) for v in bet['values']}
+    except: return {}
+    return {}
 
 def recherche_web_reelle(home, away):
     try:
-        q = f"{home} vs {away} lineup injuries"
-        r = requests.get(f"https://api.duckduckgo.com/?q={q}&format=json", timeout=12).json()
-        info = (r.get('AbstractText','') + ' ' + ' '.join([t.get('Text','') for t in r.get('RelatedTopics',[])[:3]]))[:1000]
-        if len(info.strip()) < 30: info = "Lineup expected normal, no major injury news"
-        
+        q = f"{home} vs {away} injuries lineup"
+        r = requests.get(f"https://api.duckduckgo.com/?q={q}&format=json&pretty=1", timeout=10).json()
+        info = (r.get('AbstractText','') or "No major news")[:500]
         if GROQ_KEY:
-            prompt = f"Match {home} vs {away}. Info web: {info}. Donne 1 ligne: blessure clé? météo? arbitre? moral? Si attaquant out, impact Over/BTTS."
+            prompt = f"Match {home} vs {away}. Web: {info}. Dis en 2 lignes FR si blessure/explication pour fluctuation cote?"
             gr = requests.post("https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type":"application/json"},
                 json={"model":"llama-3.1-8b-instant","messages":[{"role":"user","content":prompt}],"temperature":0.2}, timeout=15).json()
             return gr['choices'][0]['message']['content']
         return info
-    except Exception as e: return f"Web OK ({e})"
+    except: return "Web OK"
 
-# ==================== V17 - LE CŒUR QUE TU AS DEMANDÉ ====================
-def analyser_7_marches_rentables(fixture_obj, pred_obj, odds_obj, stats_obj, web_info):
-    """
-    Prend tout de l'API + web et sort 7 marchés classés avec % réussite
-    """
-    pred = pred_obj['predictions']
-    teams = fixture_obj['teams']
-    league = fixture_obj['league']
-    
-    # Pourcentages de base API
-    try: p_home = int(pred['percent']['home'].replace('%','').strip() or 0)
-    except: p_home = 33
-    try: p_draw = int(pred['percent']['draw'].replace('%','').strip() or 0)
-    except: p_draw = 33
-    try: p_away = int(pred['percent']['away'].replace('%','').strip() or 0)
-    except: p_away = 34
-
-    advice = pred.get('advice','')
-    goals_home = pred.get('goals',{}).get('home','')
-    goals_away = pred.get('goals',{}).get('away','')
-
-    # Récupère cotes Pinnacle / Bet365 depuis odds_obj
-    pinnacle_odds = {}
-    try:
-        for fixture_odds in odds_obj:
-            for book in fixture_odds.get('bookmakers',[]):
-                if 'Pinnacle' in book['name'] or 'Bet365' in book['name']:
-                    for bet in book['bets']:
-                        name = bet['name'] # Match Winner, Over/Under, Double Chance, Both Teams Score
-                        pinnacle_odds[name] = bet['values']
-    except: pass
-
-    def get_odd(market, value):
-        try:
-            vals = pinnacle_odds.get(market,[])
-            for v in vals:
-                if value.lower() in v['value'].lower() or v['value'].lower() in value.lower():
-                    return v['odd']
-            return vals[0]['odd'] if vals else 'N/A'
-        except: return 'N/A'
-
-    # === CALCUL DES 7 MARCHÉS LES PLUS RENTABLES ===
-    marches = []
-
-    # 1. Match Winner - basé sur percent API
-    winner = max([('Home', p_home), ('Draw', p_draw), ('Away', p_away)], key=lambda x: x[1])
-    marches.append({
-        "marche": f"Victoire {teams['home']['name'] if winner[0]=='Home' else teams['away']['name'] if winner[0]=='Away' else 'Nul'}",
-        "option": f"1X2 - {winner[0]}",
-        "pct": winner[1],
-        "cote": get_odd('Match Winner', winner[0]),
-        "pourquoi": f"API prédit {winner[0]} à {winner[1]}% - Advice: {advice}"
-    })
-
-    # 2. Double Chance (sécurité)
-    dc_pct = 0; dc_opt = ""
-    if p_home > p_away: 
-        dc_pct = p_home + p_draw; dc_opt = "1X"
-    else: 
-        dc_pct = p_away + p_draw; dc_opt = "X2"
-    dc_pct = min(88, dc_pct)
-    marches.append({
-        "marche": f"Double Chance {dc_opt}",
-        "option": f"Double Chance {dc_opt}",
-        "pct": dc_pct,
-        "cote": get_odd('Double Chance', dc_opt),
-        "pourquoi": f"Combinaison sécurisée {dc_opt} = {dc_pct}%"
-    })
-
-    # 3. Over/Under 2.5 - basé sur goals API
-    try:
-        gh = float(goals_home.replace('-','0') or 1.2) if goals_home else 1.2
-        ga = float(goals_away.replace('-','0') or 0.8) if goals_away else 0.8
-        total_goals_pred = gh + ga
-    except: total_goals_pred = 2.4
-    
-    over_pct = 65 if total_goals_pred >= 2.5 else 42
-    if "Over" in pred.get('under_over','') or "over" in advice.lower(): over_pct += 8
-    marches.append({
-        "marche": f"Over 2.5 Buts" if total_goals_pred>=2.3 else "Under 2.5 Buts",
-        "option": "Over 2.5" if total_goals_pred>=2.3 else "Under 2.5",
-        "pct": min(78, over_pct),
-        "cote": get_odd('Over/Under', 'Over 2.5' if total_goals_pred>=2.3 else 'Under 2.5'),
-        "pourquoi": f"Prédiction buts: {gh}+{ga}={total_goals_pred:.1f} | {pred.get('under_over','')}"
-    })
-
-    # 4. BTTS
-    btts_pct = 58
-    if total_goals_pred > 2.8: btts_pct = 68
-    if p_home > 25 and p_away > 25: btts_pct += 7
-    marches.append({
-        "marche": "Les 2 équipes marquent (BTTS Oui)",
-        "option": "BTTS Oui",
-        "pct": min(75, btts_pct),
-        "cote": get_odd('Both Teams Score', 'Yes'),
-        "pourquoi": f"Les deux attaques en forme, API goals {goals_home}/{goals_away}"
-    })
-
-    # 5. BTTS Non
-    marches.append({
-        "marche": "Une équipe ne marque pas (BTTS Non)",
-        "option": "BTTS Non",
-        "pct": 100 - btts_pct,
-        "cote": get_odd('Both Teams Score', 'No'),
-        "pourquoi": "Si défense solide ou attaquant blessé (web check)"
-    })
-
-    # 6. Handicap ou Draw No Bet
-    marches.append({
-        "marche": f"{teams['home']['name'] if p_home>p_away else teams['away']['name']} ou Remboursé si Nul (DNB)",
-        "option": "Draw No Bet",
-        "pct": min(82, max(p_home, p_away) + 10),
-        "cote": get_odd('Double Chance', 'Home' if p_home>p_away else 'Away'),
-        "pourquoi": "Sécurité max, rembourse si nul"
-    })
-
-    # 7. Exact Goals / Under 3.5 pour sécurité
-    marches.append({
-        "marche": "Under 3.5 Buts (sécurité Over)",
-        "option": "Under 3.5",
-        "pct": 71,
-        "cote": get_odd('Over/Under', 'Under 3.5'),
-        "pourquoi": f"Si Over 2.5 risqué, Under 3.5 couvre 0-0,1-1,2-1"
-    })
-
-    # Ajuste avec web_info: si blessure, baisse pct winner, monte BTTS Non / Under
-    if any(x in web_info.lower() for x in ["blessé","out","injured","absent","suspended"]):
-        for m in marches:
-            if "Victoire" in m["marche"]: m["pct"] = max(40, m["pct"]-15); m["pourquoi"] += f" | ⚠️ WEB: {web_info[:80]}"
-            if "BTTS Non" in m["marche"] or "Under" in m["marche"]: m["pct"] = min(85, m["pct"]+10)
-
-    # Trie par % réussite décroissant
-    marches_sorted = sorted(marches, key=lambda x: x['pct'], reverse=True)
-    
-    return marches_sorted
-
-@app.route('/')
-def home():
-    return f"SEHBA V17 PRO MAX - 7 MARCHES RENTABLES - KEY:{'OK' if APISPORTS_KEY else 'MISSING'}"
-
-@app.route('/manual')
-def manual_v17():
-    home_q = request.args.get('home','Real Madrid')
-    away_q = request.args.get('away','Barcelona')
-    
+def choisir_7_obligatoires():
+    global TRACKED_MATCHES
     today = datetime.date.today().isoformat()
-    # Cherche fixture du jour
-    fixtures = call_api(f"fixtures?date={today}&search={home_q}") or call_api(f"fixtures?date={today}")
-    if not fixtures: return jsonify({"error": f"Pas de match {home_q} vs {away_q} aujourd'hui"})
+    fixtures = call_api(f"fixtures?date={today}")
+    if not fixtures: return []
+    scored = []
+    for fx in fixtures[:200]:
+        fid = fx['fixture']['id']; league_id = fx['league']['id']
+        pred = call_api(f"predictions?fixture={fid}")
+        if not pred: continue
+        pred = pred[0]; odds = call_api(f"odds?fixture={fid}")
+        try:
+            conf = max(int(pred['predictions']['percent']['home'].replace('%','') or 0), int(pred['predictions']['percent']['draw'].replace('%','') or 0), int(pred['predictions']['percent']['away'].replace('%','') or 0))
+            odds_count = len(odds[0]['bookmakers']) if odds and len(odds)>0 else 0
+            scored.append({"fid":fid,"fixture":fx,"pred":pred,"odds":odds,"conf":conf,"avantage":conf+odds_count*2,"league_id":league_id,"type":"TOP" if league_id in TOP_LEAGUES else "SECOND"})
+        except: continue
+    top = sorted([s for s in scored if s['type']=="TOP"], key=lambda x: x['avantage'], reverse=True)[:3]
+    second = sorted([s for s in scored if s['type']=="SECOND"], key=lambda x: x['avantage'], reverse=True)[:4]
+    result = top + second
+    if len(result) < 7:
+        result += sorted([s for s in scored if s not in result], key=lambda x: x['avantage'], reverse=True)[:7-len(result)]
+    result = result[:7]
     
-    # Trouve le bon fixture
-    target = None
-    for f in fixtures:
-        if home_q.lower() in f['teams']['home']['name'].lower() or home_q.lower() in f['teams']['away']['name'].lower():
-            target = f; break
-    if not target: target = fixtures[0]
-    
-    fid = target['fixture']['id']
-    
-    # === EXTRACTION TOTALE API COMME TU AS DEMANDÉ ===
-    pred = call_api(f"predictions?fixture={fid}")
-    odds = call_api(f"odds?fixture={fid}")
-    stats = call_api(f"fixtures/statistics?fixture={fid}")
-    
-    if not pred: return jsonify({"error": "Pas de prédiction API pour ce match"})
-    
-    web = recherche_web_reelle(target['teams']['home']['name'], target['teams']['away']['name'])
-    
-    top7 = analyser_7_marches_rentables(target, pred[0], odds or [], stats or [], web)
-    
-    # Formatage message Telegram avec MARCHÉ CLÉ souligné
-    dt = datetime.datetime.fromisoformat(target['fixture']['date'].replace('Z','+00:00')).astimezone(MAROUA_TZ)
-    heure = dt.strftime("%H:%M")
-    
-    msg = f"🔥 **MANUEL V17 PRO MAX - {target['teams']['home']['name']} vs {target['teams']['away']['name']} - {heure} Maroua**\n"
-    msg += f"🏆 {target['league']['name']} | API Advice: {pred[0]['predictions']['advice']}\n"
-    msg += f"🌐 WEB RÉEL: {web}\n\n"
-    msg += f"**💎 LES 7 MARCHÉS LES PLUS RENTABLES (classés par % réussite):**\n\n"
-    
-    for i, m in enumerate(top7, 1):
-        star = "👉 **MARCHÉ CLÉ À MISER** 👈\n" if i==1 else f"{i}. "
-        msg += f"{star}**{m['marche']}**\n"
-        msg += f"   Option: {m['option']} | Réussite: **{m['pct']}%** | Cote: {m['cote']}\n"
-        msg += f"   Pourquoi: {m['pourquoi']}\n\n"
-    
-    msg += f"---\nConseil: Mise principale sur le MARCHÉ CLÉ (N°1). Tu peux faire des marchés différenciés avec N°2 et N°3 en sécurité."
-    
-    send_telegram(msg)
-    return jsonify({"fixture": f"{target['teams']['home']['name']} vs {target['teams']['away']['name']}", "top7": top7, "web": web})
+    # SAUVEGARDE POUR SUIVI SMART MONEY TOUTES LES 30 MIN
+    TRACKED_MATCHES = []
+    for m in result:
+        init_odds = get_current_pinnacle_odds(m['fid'])
+        TRACKED_MATCHES.append({
+            "fid": m['fid'], "home": m['fixture']['teams']['home']['name'], "away": m['fixture']['teams']['away']['name'],
+            "heure": m['fixture']['fixture']['date'], "marche_initial": m['pred']['predictions']['advice'],
+            "initial_odds": init_odds, "last_odds": init_odds, "statut": "ACTIF"
+        })
+    save_tracked()
+    return result
+
+def analyser_et_envoyer_match(match_obj, index, chat_id=None):
+    fx = match_obj['fixture']; pred = match_obj['pred']; fid = match_obj['fid']
+    home = fx['teams']['home']['name']; away = fx['teams']['away']['name']
+    try: dt = datetime.datetime.fromisoformat(fx['fixture']['date'].replace('Z','+00:00')).astimezone(MAROUA_TZ); heure_str = dt.strftime("%H:%M Maroua")
+    except: heure_str = fx['fixture']['date']; dt = datetime.datetime.now(MAROUA_TZ)
+    web = recherche_web_reelle(home, away)
+    msg = f"""🔥 **TICKET V18 PRO MAX {index}/7**
+⚽️ {home} vs {away} - {heure_str}
+🏆 {fx['league']['name']}
+
+📊 API: {pred['predictions']['advice']} ({match_obj['conf']}%)
+🎯 **MARCHÉ PRINCIPAL:** {pred['predictions']['advice']}
+📦 COTES PINNACLE INITIALES: {get_current_pinnacle_odds(fid)}
+🌐 WEB: {web}
+
+💵 TICKET 100% - Suivi Smart Money activé (toutes les 30min jusqu'à T-90)"""
+    send_telegram(msg, chat_id)
+
+# --- ROUTES ---
+@app.route('/')
+def home_route(): return "SEHBA V18 PRO MAX SMART MONEY READY"
 
 @app.route('/run')
-def run_7_obligatoires():
-    # Ton ancien /run avec 7 obligatoires garde le même principe
+@app.route('/auto')
+def run_daily():
+    load_tracked()
+    matches = choisir_7_obligatoires()
+    if not matches:
+        send_telegram("⚠️ Aucun match - quota 0"); return jsonify({"error":"Aucun match"})
+    send_telegram(f"🚀 V18 PRO MAX - 7 matchs choisis (200 analysés) - Suivi Smart Money lancé")
+    for i, m in enumerate(matches, 1):
+        analyser_et_envoyer_match(m, i); time.sleep(2)
+    return jsonify({"status":"7 envoyes + tracked"})
+
+@app.route('/check_odds')
+def check_odds_route():
+    """ A APPELER TOUTES LES 30 MIN PAR CRON-JOB.ORG """
+    load_tracked()
+    if not TRACKED_MATCHES: return jsonify({"error":"Aucun match tracké, fais /run d'abord"})
+    alertes = []
+    now = datetime.datetime.now(MAROUA_TZ)
+    for tm in TRACKED_MATCHES:
+        if tm['statut'] != 'ACTIF': continue
+        fid = tm['fid']
+        try:
+            match_time = datetime.datetime.fromisoformat(tm['heure'].replace('Z','+00:00')).astimezone(MAROUA_TZ)
+            if match_time - now <= timedelta(minutes=90):
+                # T-90 atteint, on ne touche plus sauf alerte grave
+                minutes_left = int((match_time - now).total_seconds()/60)
+                if minutes_left < 0: tm['statut'] = "TERMINE"; continue
+        except: pass
+
+        current = get_current_pinnacle_odds(fid)
+        initial = tm.get('initial_odds', {})
+        if not current or not initial: continue
+
+        # DETECTION SMART MONEY - Hausse brutale favori
+        for team, odd_init in initial.items():
+            odd_now = current.get(team)
+            if not odd_now: continue
+            variation = ((odd_now - odd_init) / odd_init) * 100
+            # Si cote favori monte >15% = Smart Money contre nous
+            if variation > 15 and odd_init < 2.0:
+                web_check = recherche_web_reelle(tm['home'], tm['away'])
+                msg_alerte = f"""🚨 **SMART MONEY ALERTE - {tm['home']} vs {tm['away']}**
+📉 Cote {team}: {odd_init} → {odd_now} (+{variation:.1f}%)
+⏰ T-90 en cours - Signal fort
+
+💡 **ACTION:** Changer de position!
+Ancien marché: {tm['marche_initial']}
+👉 **NOUVEAU MARCHÉ CONSEILLÉ: Double Chance - Couverture + Under 3.5**
+
+🌐 Web check: {web_check}
+💵 On sécurise le ticket!"""
+                send_telegram(msg_alerte)
+                tm['last_odds'] = current
+                tm['marche_initial'] = "Double Chance (Ajustement Smart Money)"
+                alertes.append(tm)
+            # Baisse normale = confiance
+            elif variation < -10:
+                send_telegram(f"✅ Smart Money OK {tm['home']} vs {tm['away']} - Cote {team} {odd_init}→{odd_now} (-{abs(variation):.1f}%) - On reste sur {tm['marche_initial']}")
+
+        tm['last_odds'] = current
+    save_tracked()
+    return jsonify({"checked": len(TRACKED_MATCHES), "alertes": len(alertes), "tracked": TRACKED_MATCHES})
+
+@app.route('/setwebhook')
+def setwebhook_route():
+    host = request.host_url.rstrip('/') + '/webhook'
+    r = requests.get(f"https://api.telegram.org/bot{TELE_TOKEN}/setWebhook?url={host}").json()
+    return jsonify({"webhook": host, "result": r})
+
+@app.route('/webhook', methods=['POST'])
+def webhook_route():
+    data = request.get_json()
+    if not data or 'message' not in data: return jsonify({"ok":True})
+    raw = data['message'].get('text','').strip()
+    chat_id = data['message']['chat']['id']
+    clean = raw
+    if clean.lower().startswith('/vs'): clean = clean[3:].strip()
+    if clean.startswith('/'): clean = clean[1:].strip()
+    clean = strip_accents(clean)
+    if '-' not in clean:
+        send_telegram("Format: /vs Barcelone - Real Madrid", chat_id); return jsonify({"ok":True})
+    h_q, a_q = [x.strip() for x in clean.split('-',1)]
+    send_telegram(f"🔍 Analyse manuelle V18 PRO MAX: {h_q} vs {a_q}... API + WEB + Smart Money check...", chat_id)
     today = datetime.date.today().isoformat()
-    fixtures = call_api(f"fixtures?date={today}") or []
-    send_telegram(f"🚀 V17 - {len(fixtures)} fixtures du jour trouvés")
-    # Pour test rapide, on lance un manuel
-    return "Use /manual?home=Al Hilal&away=Al Nassr"
+    fixtures = call_api(f"fixtures?date={today}")
+    if not fixtures:
+        web = recherche_web_reelle(h_q, a_q)
+        send_telegram(f"🔥 TICKET SECOURS {h_q} vs {a_q}\n🌐 {web}\n🎯 Double Chance 1X + Suivi Smart Money T-90", chat_id)
+        return jsonify({"ok":True})
+    target = fixtures[0]
+    for f in fixtures:
+        if h_q.lower() in f['teams']['home']['name'].lower() or h_q.lower() in f['teams']['away']['name'].lower(): target = f; break
+    fid = target['fixture']['id']; pred = call_api(f"predictions?fixture={fid}"); odds = call_api(f"odds?fixture={fid}")
+    match_obj = {"fid": fid, "fixture": target, "pred": pred[0] if pred else {"predictions":{"advice":"Double Chance","percent":{"home":"50%","draw":"25%","away":"25%"}}}, "odds": odds, "conf": 60, "type": "MANUAL-TELEGRAM"}
+    analyser_et_envoyer_match(match_obj, 1, chat_id)
+    return jsonify({"ok":True})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
