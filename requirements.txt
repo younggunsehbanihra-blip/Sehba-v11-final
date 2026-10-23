@@ -1,5 +1,6 @@
-Flask
-requests
-gspread
-google-auth
-gunicorn
+Flask==3.0.3
+requests==2.32.3
+beautifulsoup4==4.12.3
+gspread==6.1.2
+google-auth==2.35.0
+tavily-python==0.5.0
