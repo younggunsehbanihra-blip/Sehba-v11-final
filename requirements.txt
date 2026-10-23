@@ -1,6 +1,5 @@
 Flask
 requests
-groq
+gspread
+google-auth
 gunicorn
-beautifulsoup4
-
