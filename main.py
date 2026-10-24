@@ -3,13 +3,11 @@ from flask import Flask, request, jsonify
 from datetime import timezone, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
-
 try:
     from tavily import TavilyClient
 except: TavilyClient = None
 
 app = Flask(__name__)
-
 APISPORTS_KEY = os.getenv("APISPORTS_KEY") or os.getenv("SPORTS_API_KEY")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 TELE_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -17,17 +15,16 @@ TELE_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDS_RAW = os.getenv("GOOGLE_CREDENTIALS_JSON")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-
 BASE = "https://v3.football.api-sports.io"
 HEADERS = {"x-apisports-key": APISPORTS_KEY} if APISPORTS_KEY else {}
 MAROUA_TZ = timezone(timedelta(hours=1))
-
-TOP_LEAGUES = [39, 140, 135, 78, 61]
-SECOND_LEAGUES = [40, 141, 136, 79, 62]
 TRACKED_FILE = "/tmp/tracked.json"
 TRACKED_MATCHES = []
 LAST_RUN_FILE = "/tmp/last_run.txt"
 TAVILY_CACHE_FILE = "/tmp/tavily_cache.json"
+
+def get_today_maroua():
+    return datetime.datetime.now(MAROUA_TZ).date().isoformat()
 
 def ecrire_dans_sheet(date_str, match, league, prono, cote, note):
     if not GOOGLE_CREDS_RAW or not GOOGLE_SHEET_ID: return
@@ -64,14 +61,13 @@ def call_api(endpoint):
     if not APISPORTS_KEY: return []
     try:
         res = requests.get(f"{BASE}/{endpoint}", headers=HEADERS, timeout=15).json()
-        if res.get('errors'): return []
+        if res.get('errors'): print(f"API Error {endpoint}: {res.get('errors')}"); return []
         return res.get('response', [])
-    except: return []
+    except Exception as e: print(f"call_api {e}"); return []
 
-# --- NOUVEAU : TOUTES LES COTES PINNACLE (TOUS MARCHES) POUR QUE L'IA CHOISISSE ---
 def get_all_pinnacle_odds(fid):
     odds = call_api(f"odds?fixture={fid}")
-    if not odds: return {}, "Aucune cote"
+    if not odds: return {}, "Aucune cote encore"
     try:
         for fx in odds:
             for book in fx.get('bookmakers', []):
@@ -101,7 +97,7 @@ def save_tavily_cache(c):
 
 def recherche_web_contextuelle(home, away):
     query = f"{home} {away} injuries suspensions lineup news today"
-    today = datetime.date.today().isoformat()
+    today = get_today_maroua()
     cache = get_tavily_cache()
     key = f"{today}_{home}_{away}"
     if key in cache: return cache[key]
@@ -119,36 +115,25 @@ def recherche_web_contextuelle(home, away):
 def detect_smart_money(old_odds, new_odds):
     if not old_odds or not new_odds: return "RAS"
     try:
-        # Ex: Home 1.50 -> 1.85 = +23% = argent sort de Home = danger
         for k in new_odds:
             if k in old_odds and old_odds[k] > 0:
                 change = (new_odds[k] - old_odds[k]) / old_odds[k]
-                if change > 0.12: # cote monte de 12% = smart money contre ce choix
-                    return f"ALERTE SMART MONEY: {k} {old_odds[k]} -> {new_odds[k]} (+{int(change*100)}%) - L'argent intelligent sort de {k}"
-                if change < -0.12:
-                    return f"SMART MONEY CONFIRME: {k} {old_odds[k]} -> {new_odds[k]} (-{int(abs(change)*100)}%) - Argent entre sur {k}"
+                if change > 0.12: return f"ALERTE SMART MONEY: {k} {old_odds[k]} -> {new_odds[k]} (+{int(change*100)}%)"
+                if change < -0.12: return f"SMART MONEY CONFIRME: {k} {old_odds[k]} -> {new_odds[k]} (-{int(abs(change)*100)}%)"
     except: pass
     return "RAS"
 
-def arbitrage_ia_contextuel_pro(home, away, prono_natif, league_name, all_markets_text, smart_money_signal):
+def arbitrage_ia_contextuel_pro(home, away, prono_natif, league_name, all_markets_text, smart_money_signal, prob_pct=50):
     if not GROQ_KEY: return prono_natif, "Validation auto"
     contexte_web = recherche_web_contextuelle(home, away)
-    prompt = f"""Tu es SEHBA V21 FINAL - GPT-OSS 120B - ARBITRE SMART MONEY.
+    prompt = f"""SEHBA V22 ALL LEAGUES - ARBITRE SMART.
 Match: {home} vs {away} - {league_name}
-Prono natif API: {prono_natif}
-Infos WEB (Tavily): {contexte_web}
-Marchés Pinnacle disponibles: {all_markets_text}
-Signal SMART MONEY: {smart_money_signal}
-
-CONSIGNE FINALE:
-1. Si SMART MONEY dit que l'argent sort de ton prono natif (cote qui monte de 12%+), tu DOIS changer de marché pour contrecarrer.
-   Ex: Si Home Win 1.5 -> 1.85, passe à 1X ou Over 1.5 ou Under 3.5 ou BTTS selon contexte.
-2. Si web = blessure star, change aussi.
-3. Sinon garde le natif.
-Tu as accès à TOUS les marchés de Pinnacle, choisis le plus safe.
-
-Réponds: DECISION: [Marché final exact] | JUSTIF: [15 mots FR avec raison web + smart money]"""
-
+Prono natif: {prono_natif} ({prob_pct}%)
+WEB Tavily: {contexte_web}
+Pinnacle TOUS MARCHES: {all_markets_text}
+Signal: {smart_money_signal}
+CONSIGNE: Tu as TOUS les marchés. Si SMART MONEY alerte, change de marché (ex 1X, Over, BTTS). Sinon garde natif mais choisis le marché le plus safe.
+Réponds: DECISION: [Marché final] | JUSTIF: [15 mots FR]"""
     try:
         r = requests.post("https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type":"application/json"},
@@ -163,19 +148,13 @@ Réponds: DECISION: [Marché final exact] | JUSTIF: [15 mots FR avec raison web 
 
 def choisir_7_obligatoires():
     global TRACKED_MATCHES
-    today = datetime.date.today().isoformat()
+    today = get_today_maroua()
     fixtures = call_api(f"fixtures?date={today}")
     if not fixtures: return []
-    filtered = []
-    for fx in fixtures:
-        if fx['fixture']['status']['short'] == 'NS':
-            lid = fx['league']['id']
-            if lid in TOP_LEAGUES: filtered.append((fx, "TOP", 10))
-            elif lid in SECOND_LEAGUES: filtered.append((fx, "SECOND", 5))
-            else: filtered.append((fx, "OTHER", 1))
-    filtered = sorted(filtered, key=lambda x: x[2], reverse=True)[:15]
+    filtered = [fx for fx in fixtures if fx['fixture']['status']['short'] == 'NS']
+    print(f"V22 ALL: {len(filtered)} matchs NS pour {today}")
     scored = []
-    for fx, l_type, _ in filtered:
+    for fx in filtered[:50]:
         fid = fx['fixture']['id']
         pred_res = call_api(f"predictions?fixture={fid}")
         if not pred_res: continue
@@ -183,17 +162,13 @@ def choisir_7_obligatoires():
         try:
             pct = pred.get('predictions', {}).get('percent', {})
             conf = max(int(str(pct.get('home','0')).replace('%','') or 0), int(str(pct.get('draw','0')).replace('%','') or 0), int(str(pct.get('away','0')).replace('%','') or 0))
-            scored.append({"fid": fid, "fixture": fx, "pred": pred, "conf": conf, "avantage": conf + (10 if l_type=="TOP" else 5), "type": l_type})
+            scored.append({"fid": fid, "fixture": fx, "pred": pred, "conf": conf, "avantage": conf})
         except: continue
-    top = sorted([s for s in scored if s['type']=="TOP"], key=lambda x: x['avantage'], reverse=True)[:3]
-    second = sorted([s for s in scored if s['type']=="SECOND"], key=lambda x: x['avantage'], reverse=True)[:4]
-    result = top + second
-    if len(result) < 7: result += sorted([s for s in scored if s not in result], key=lambda x: x['avantage'], reverse=True)[:7-len(result)]
-    result = result[:7]
+    result = sorted(scored, key=lambda x: x['avantage'], reverse=True)[:7]
     TRACKED_MATCHES = []
     for m in result:
         init_odds, _ = get_all_pinnacle_odds(m['fid'])
-        TRACKED_MATCHES.append({"fid": m['fid'], "home": m['fixture']['teams']['home']['name'], "away": m['fixture']['teams']['away']['name'], "heure": m['fixture']['fixture']['date'], "initial_odds": init_odds, "last_odds": init_odds, "statut": "ATTENTE", "prono_envoye": ""})
+        TRACKED_MATCHES.append({"fid": m['fid'], "home": m['fixture']['teams']['home']['name'], "away": m['fixture']['teams']['away']['name'], "heure": m['fixture']['fixture']['date'], "initial_odds": init_odds, "last_odds": init_odds, "statut": "ATTENTE", "prono_envoye": "", "league": m['fixture']['league']['name']})
     save_tracked()
     return result
 
@@ -207,63 +182,63 @@ def analyser_et_envoyer_match(match_obj, index, chat_id=None, smart_signal="RAS"
     except:
         heure_str = fx['fixture']['date']; dt = datetime.datetime.now(MAROUA_TZ)
     prono_natif = pred['predictions'].get('advice', 'Double Chance')
+    pct = pred.get('predictions', {}).get('percent', {})
+    try: prob = int(str(pct.get('home','50')).replace('%','') or 50)
+    except: prob = 50
     odds_dict, markets_text = get_all_pinnacle_odds(fid)
-    prono_final, note_ia = arbitrage_ia_contextuel_pro(home, away, prono_natif, fx['league']['name'], markets_text, smart_signal)
     odds_str = ", ".join([f"{k}: {v}" for k, v in odds_dict.items()]) if odds_dict else markets_text[:200]
-    msg = f"🔥 *TICKET V21 SMART {index}*\n⚽️ {home} vs {away} - {heure_str}\n🏆 {fx['league']['name']}\n\n📊 NATIF: {prono_natif}\n📦 MARCHES: {markets_text[:300]}\n🎯 *FINAL:* {prono_final}\n💰 COTES: {odds_str}\n🧠 {note_ia}\n📈 {smart_signal}"
+    prono_final, note_ia = arbitrage_ia_contextuel_pro(home, away, prono_natif, fx['league']['name'], markets_text, smart_signal, prob)
+    msg = f"🔥 *TICKET V22 ALL {index}*\n⚽️ {home} vs {away} - {heure_str}\n🏆 {fx['league']['name']}\n\n📊 NATIF: {prono_natif} ({prob}%)\n📦 MARCHES: {markets_text[:400]}\n🎯 *FINAL:* {prono_final}\n💰 COTES: {odds_str}\n🧠 {note_ia}\n📈 {smart_signal}"
     send_telegram(msg, chat_id)
     ecrire_dans_sheet(dt.strftime("%Y-%m-%d %H:%M"), f"{home} - {away}", fx['league']['name'], prono_final, odds_str, note_ia + " | " + smart_signal)
 
 @app.route('/')
-def home_route(): return "SEHBA V21 FINAL SMART MONEY - ACTIF"
+def home_route(): return "SEHBA V22 ALL LEAGUES - ACTIF"
 @app.route('/ping')
-def ping_route(): return jsonify({"status":"alive", "version":"V21 SMART", "tracked": len(TRACKED_MATCHES)})
+def ping_route(): return jsonify({"status":"alive", "version":"V22 ALL", "tracked": len(TRACKED_MATCHES), "date_maroua": get_today_maroua()})
 
 @app.route('/run')
 def run_daily():
-    today = datetime.date.today().isoformat()
+    today = get_today_maroua()
     try:
         with open(LAST_RUN_FILE, 'r') as f:
-            if f.read().strip() == today: return jsonify({"status":"Deja lance"})
+            if f.read().strip() == today: return jsonify({"status":"Deja lance", "date":today})
     except: pass
     load_tracked()
     matches = choisir_7_obligatoires()
-    if not matches: return jsonify({"error":"Aucun match"})
+    if not matches: 
+        send_telegram(f"ℹ️ V22 ALL: Aucun match trouvé pour {today}.")
+        return jsonify({"error":"Aucun match", "date":today})
     with open(LAST_RUN_FILE, 'w') as f: f.write(today)
-    msg = "🚀 *V21 FINAL - 7 matchs en SUIVI SMART MONEY:*\n"
+    msg = f"🚀 *V22 ALL - 7 matchs SUIVI pour {today} (tous championnats):*\n"
     for m in TRACKED_MATCHES:
         dt = datetime.datetime.fromisoformat(m['heure'].replace('Z','+00:00')).astimezone(MAROUA_TZ)
-        msg += f"- {m['home']} vs {m['away']} à {dt.strftime('%H:%M')} -> analyse H-90min\n"
+        msg += f"- {m['home']} vs {m['away']} ({m['league']}) à {dt.strftime('%H:%M')} -> H-90\n"
     send_telegram(msg)
-    return jsonify({"status":"7 en ATTENTE SMART"})
+    return jsonify({"status":"7 en ATTENTE", "date":today})
 
 @app.route('/check_and_analyze')
 def check_and_analyze():
     load_tracked()
-    if not TRACKED_MATCHES: return jsonify({"status":"vide"})
+    if not TRACKED_MATCHES: return jsonify({"status":"vide", "date":get_today_maroua()})
     now = datetime.datetime.now(MAROUA_TZ)
     fait = 0
     for m in TRACKED_MATCHES:
         try:
             match_time = datetime.datetime.fromisoformat(m['heure'].replace('Z','+00:00')).astimezone(MAROUA_TZ)
             diff_min = (match_time - now).total_seconds() / 60
-            
-            # On check les cotes seulement si match dans <3h pour économiser
             smart_signal = "RAS"
             if diff_min < 180:
                 new_odds, _ = get_all_pinnacle_odds(m['fid'])
                 smart_signal = detect_smart_money(m.get('last_odds'), new_odds)
                 if "ALERTE" in smart_signal and m.get("statut") == "ANALYSE":
-                    # SMART MONEY après analyse -> on RE-ANALYSE et on change
                     fx = call_api(f"fixtures?id={m['fid']}")
                     pr = call_api(f"predictions?fixture={m['fid']}")
                     if fx and pr:
                         match_obj = {"fid": m['fid'], "fixture": fx[0], "pred": pr[0], "conf": 70}
-                        analyser_et_envoyer_match(match_obj, f"RE-ANALYSE SMART {m['home'][:5]}", None, smart_signal)
+                        analyser_et_envoyer_match(match_obj, f"RE-ANALYSE {m['home'][:5]}", None, smart_signal)
                         fait += 1
                 if new_odds: m['last_odds'] = new_odds
-
-            # Analyse initiale H-90min
             if m.get("statut") == "ATTENTE" and 30 <= diff_min <= 90:
                 fx = call_api(f"fixtures?id={m['fid']}")
                 pr = call_api(f"predictions?fixture={m['fid']}")
@@ -275,7 +250,12 @@ def check_and_analyze():
                     time.sleep(3)
         except Exception as e: print(f"Err {e}")
     save_tracked()
-    return jsonify({"lancees": fait, "heure": now.strftime("%H:%M")})
+    return jsonify({"lancees": fait, "heure": now.strftime("%H:%M"), "date":now.strftime("%Y-%m-%d")})
+
+def find_team_id(name):
+    res = call_api(f"teams?search={name}")
+    if res: return res[0]['team']['id']
+    return None
 
 @app.route('/webhook', methods=['POST'])
 def webhook_route():
@@ -287,44 +267,38 @@ def webhook_route():
     clean_raw = raw[3:].strip()
     clean = strip_accents(clean_raw)
     lower = clean.lower()
-    sep = None
     if ' - ' in clean: sep = ' - '
     elif ' vs ' in lower:
-        idx = lower.find(' vs ')
-        clean = clean[:idx] + ' - ' + clean[idx+4:]
-        sep = ' - '
+        idx = lower.find(' vs '); clean = clean[:idx] + ' - ' + clean[idx+4:]; sep = ' - '
     elif ' v ' in f" {lower} ":
-        idx = lower.find(' v ')
-        clean = clean[:idx] + ' - ' + clean[idx+3:]
-        sep = ' - '
+        idx = lower.find(' v '); clean = clean[:idx] + ' - ' + clean[idx+3:]; sep = ' - '
+    else: sep = None
     if not sep or ' - ' not in clean:
         send_telegram("Format: /vs Real - Leipzig", chat_id)
         return jsonify({"ok":True})
     h_q, a_q = [x.strip() for x in clean.split(' - ', 1)]
-    send_telegram(f"🔍 *V21 Manuel SMART: {h_q} vs {a_q} + Tavily + Smart...*", chat_id)
+    send_telegram(f"🔍 *V22 ALL: {h_q} vs {a_q} + Tavily + Smart...*", chat_id)
     target = None
-    for q in [h_q, a_q]:
-        fixtures = call_api(f"fixtures?search={q}")
-        if fixtures:
+    for name in [h_q, a_q]:
+        tid = find_team_id(name)
+        if tid:
+            fixtures = call_api(f"fixtures?team={tid}&next=10")
             for f in fixtures:
-                f_date = f['fixture']['date'][:10]
-                today_plus = [(datetime.date.today() + datetime.timedelta(days=i)).isoformat() for i in range(4)]
-                if f_date in today_plus:
-                    hn = strip_accents(f['teams']['home']['name'].lower())
-                    an = strip_accents(f['teams']['away']['name'].lower())
-                    if h_q.lower() in hn or h_q.lower() in an or a_q.lower() in hn or a_q.lower() in an:
-                        target = f; break
+                hn = strip_accents(f['teams']['home']['name'].lower())
+                an = strip_accents(f['teams']['away']['name'].lower())
+                if h_q.lower() in hn or h_q.lower() in an or a_q.lower() in hn or a_q.lower() in an:
+                    target = f; break
         if target: break
     if not target:
-        send_telegram(f"❌ {h_q} vs {a_q} introuvable.", chat_id)
+        send_telegram(f"❌ {h_q} vs {a_q} introuvable. Essaie nom complet.", chat_id)
         return jsonify({"ok":True})
     fid = target['fixture']['id']
     pred = call_api(f"predictions?fixture={fid}")
     if not pred:
-        send_telegram(f"⚠️ {target['teams']['home']['name']} vs {target['teams']['away']['name']} trouvé mais pas de prono.", chat_id)
+        send_telegram(f"⚠️ {target['teams']['home']['name']} vs {target['teams']['away']['name']} trouvé mais pas de prono API.", chat_id)
         return jsonify({"ok":True})
     match_obj = {"fid": fid, "fixture": target, "pred": pred[0], "conf": 70}
-    analyser_et_envoyer_match(match_obj, "MANUEL V21 SMART", chat_id, "Analyse manuelle")
+    analyser_et_envoyer_match(match_obj, "MANUEL V22 ALL", chat_id, "Analyse manuelle")
     return jsonify({"ok":True})
 
 if __name__ == "__main__":
