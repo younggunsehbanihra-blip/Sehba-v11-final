@@ -1,4 +1,4 @@
-import os, requests, datetime, time, unicodedata, json, re
+import os, requests, datetime, time, unicodedata, json, re, math
 from flask import Flask, request, jsonify
 from datetime import timezone, timedelta
 import gspread
@@ -60,7 +60,7 @@ def call_api(endpoint):
 
 def get_all_pinnacle_odds(fid):
     odds = call_api(f"odds?fixture={fid}")
-    if not odds: return {}, "Cotes en cours"
+    if not odds: return {}, "Marche en cours"
     try:
         for fx in odds:
             for book in fx.get('bookmakers', []):
@@ -74,7 +74,7 @@ def get_all_pinnacle_odds(fid):
                         txt+=" || "
                     return od, txt[:3500]
     except: pass
-    return {}, "Cotes Pinnacle non dispo (plan gratuit)"
+    return {}, "Marche Pinnacle non dispo"
 
 def get_tavily_cache():
     try:
@@ -84,7 +84,6 @@ def save_tavily_cache(c):
     try:
         with open(TAVILY_CACHE_FILE,'w') as f: json.dump(c,f)
     except: pass
-
 def recherche_web_contextuelle(home, away):
     query = f"{home} {away} injuries lineup today"
     today = get_today_maroua()
@@ -101,17 +100,123 @@ def recherche_web_contextuelle(home, away):
         except Exception as e: print(f"Tavily {e}")
     return "RAS web"
 
-def arbitrage_ia(home, away, prono_natif, league, markets, prob=50):
-    if not GROQ_KEY: return prono_natif, "Validation auto"
-    web = recherche_web_contextuelle(home, away)
-    prompt = f"SEHBA V23 FREE - Match {home} vs {away} - {league} - Natif {prono_natif} {prob}% - Web {web} - Marches {markets} - Donne DECISION: [prono] | JUSTIF: [15 mots FR]"
+def calculer_value(prob_modele, cote):
     try:
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type":"application/json"}, json={"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":prompt}],"temperature":0.2,"max_tokens":300}, timeout=30).json()
+        if not cote or cote <= 1.01: return 0
+        prob_marche = 100 / cote
+        return round(prob_modele - prob_marche, 1)
+    except: return 0
+
+def arbitrage_ia(home, away, prono_natif, league, markets, prob=50, odds_dict=None):
+    if not GROQ_KEY: return prono_natif, "Validation base", 0, prob
+    web = recherche_web_contextuelle(home, away)
+    cote_ref = 0
+    if odds_dict:
+        if 'home' in prono_natif.lower() or home.lower() in prono_natif.lower(): cote_ref = odds_dict.get('Home',0)
+        elif 'away' in prono_natif.lower() or away.lower() in prono_natif.lower(): cote_ref = odds_dict.get('Away',0)
+        elif 'draw' in prono_natif.lower(): cote_ref = odds_dict.get('Draw',0)
+    value = calculer_value(prob, cote_ref) if cote_ref else 0
+
+    # PROMPT CLEAN - 0 MOT BET/PARI
+    prompt = f"""Tu es analyste performance football {league}.
+Match: {home} vs {away}
+Base modele: {prono_natif} confiance {prob}% | Ecart marche: {value}%
+Contexte jour: {web}
+Stats marche: {markets}
+
+Regles:
+- >=70% confiance: ORIENTATION peut etre Victoire Domicile/Exterieur seche
+- 55-69%: prefere Double Chance ou Handicap 0 (securise)
+- <55%: prefere Over 1.5, BTTS Oui, ou Handicap +0.5
+- Justifie avec blessure/compo
+
+Format:
+ORIENTATION: [choix le plus logique et securise]
+JUSTIF: [15 mots FR]
+"""
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type":"application/json"}, json={"model":"openai/gpt-oss-120b","messages":[{"role":"user","content":prompt}],"temperature":0.2,"max_tokens":320}, timeout=30).json()
         ia = r['choices'][0]['message']['content'].strip()
-        m = re.search(r"DECISION:\s*(.*)", ia, re.IGNORECASE)
-        final = m.group(1).split("|")[0].strip() if m else ia.split("\n")[0]
-        return final, ia[:250]
-    except: return prono_natif, "Defaut"
+        ori = re.search(r"ORIENTATION:\s*(.*)", ia, re.IGNORECASE)
+        final = ori.group(1).split("\n")[0].strip() if ori else prono_natif
+        if "sorry" in final.lower() or "can't help" in final.lower() or "unable" in final.lower():
+            final = prono_natif
+        return final, ia[:350], value, prob
+    except Exception as e:
+        print(f"IA err {e}")
+        return prono_natif, "Base conservee", value, prob
+
+def analyser_match_pour_coupon(match_obj):
+    fx=match_obj['fixture']; pred=match_obj['pred']
+    home=fx['teams']['home']['name']; away=fx['teams']['away']['name']
+    prono_natif=pred['predictions'].get('advice','Domicile')
+    pct=pred.get('predictions',{}).get('percent',{})
+    try:
+        # prend la proba max
+        h=int(str(pct.get('home','0')).replace('%','') or 0)
+        d=int(str(pct.get('draw','0')).replace('%','') or 0)
+        a=int(str(pct.get('away','0')).replace('%','') or 0)
+        prob=max(h,d,a)
+    except: prob=50
+    odds_dict, markets_text = get_all_pinnacle_odds(match_obj['fid'])
+    prono_final, note_ia, value, prob = arbitrage_ia(home, away, prono_natif, fx['league']['name'], markets_text, prob, odds_dict)
+    # cote retenue pour calcul combiné
+    cote_retenue = 1.30
+    if odds_dict:
+        if 'Home' in odds_dict: cote_retenue = odds_dict.get('Home',1.30)
+        if 'Away' in prono_final or 'exterieur' in prono_final.lower(): cote_retenue = odds_dict.get('Away', cote_retenue)
+        if 'Domicile' in prono_final or 'domicile' in prono_final.lower(): cote_retenue = odds_dict.get('Home', cote_retenue)
+    try:
+        dt=datetime.datetime.fromisoformat(fx['fixture']['date'].replace('Z','+00:00')).astimezone(MAROUA_TZ)
+        heure=dt.strftime("%H:%M")
+        date_s=dt.strftime("%d/%m")
+    except:
+        heure="12:30"; date_s=get_today_maroua(); dt=datetime.datetime.now(MAROUA_TZ)
+    return {
+        "fid": match_obj['fid'], "home": home, "away": away, "league": fx['league']['name'],
+        "heure": heure, "date": date_s, "dt": dt, "prono_natif": prono_natif,
+        "final": prono_final, "prob": prob, "value": value, "cote": cote_retenue,
+        "note": note_ia, "odds_str": ", ".join([f"{k}:{v}" for k,v in odds_dict.items()]) if odds_dict else markets_text[:150]
+    }
+
+def analyser_et_envoyer(match_obj, index, chat_id=None):
+    data = analyser_match_pour_coupon(match_obj)
+    abbr_h = ''.join([w[0] for w in data['home'].split()][:3]).upper()[:3]
+    abbr_a = ''.join([w[0] for w in data['away'].split()][:3]).upper()[:3]
+    code = data['fid'] % 10000
+    value_txt = f"+{data['value']}%" if data['value']>0 else f"{data['value']}%"
+    justif = data['note'].split('JUSTIF:')[-1].strip()[:180] if 'JUSTIF:' in data['note'] else data['note'][:180]
+    msg = f"📋 *COUPON V23 {index}*\n⚽️ {abbr_h}-{abbr_a} | {data['date']} {data['heure']} | Code:{code}\n🏆 {data['league']} - {data['home']} vs {data['away']}\n\n📊 BASE: {data['prono_natif']} ({data['prob']}%)\n🎯 *ORIENTATION:* {data['final']}\n💡 VALEUR: {value_txt} | {data['odds_str']}\n🧠 {justif}"
+    send_telegram(msg, chat_id)
+    ecrire_dans_sheet(f"{data['date']} {data['heure']}", f"{data['home']} - {data['away']}", data['league'], data['final'], data['odds_str'], f"V{data['value']}% {justif[:80]}")
+    return data
+
+def construire_combinés_auto(liste_data, chat_id=None):
+    # Filtre haute fiabilite pour combine
+    haute_fiab = [d for d in liste_data if d['prob'] >= 68 and d['cote'] >= 1.15 and d['cote'] <= 1.65]
+    haute_fiab = sorted(haute_fiab, key=lambda x: x['prob'], reverse=True)
+    if len(haute_fiab) < 2: return
+
+    # COMBINE 2 - les 2 plus fiables
+    comb2 = haute_fiab[:2]
+    cote2 = math.prod([d['cote'] for d in comb2])
+    prob2 = math.prod([d['prob']/100 for d in comb2]) * 100
+    msg2 = f"🔗 *COMBINE FACULTATIF 2 - HAUTE FIABILITE*\n"
+    for d in comb2:
+        msg2 += f"• {d['home'][:12]} vs {d['away'][:12]} -> {d['final']} @ {d['cote']} ({d['prob']}%)\n"
+    msg2 += f"\n📊 Cote totale: {round(cote2,2)} | Fiabilite estimee: {round(prob2,1)}% | Value globale securisee"
+    send_telegram(msg2, chat_id)
+
+    # COMBINE 3 si on a 3
+    if len(haute_fiab) >= 3:
+        comb3 = haute_fiab[:3]
+        cote3 = math.prod([d['cote'] for d in comb3])
+        prob3 = math.prod([d['prob']/100 for d in comb3]) * 100
+        msg3 = f"🔗 *COMBINE FACULTATIF 3 - EQUILIBRE*\n"
+        for d in comb3:
+            msg3 += f"• {d['home'][:12]} vs {d['away'][:12]} -> {d['final']} @ {d['cote']} ({d['prob']}%)\n"
+        msg3 += f"\n📊 Cote totale: {round(cote3,2)} | Fiabilite estimee: {round(prob3,1)}% | Ideal si pas de grosse value simple"
+        send_telegram(msg3, chat_id)
 
 def choisir_7_obligatoires():
     global TRACKED_MATCHES
@@ -139,29 +244,10 @@ def choisir_7_obligatoires():
     save_tracked()
     return result
 
-def analyser_et_envoyer(match_obj, index, chat_id=None):
-    fx=match_obj['fixture']; pred=match_obj['pred']
-    home=fx['teams']['home']['name']; away=fx['teams']['away']['name']
-    try:
-        dt=datetime.datetime.fromisoformat(fx['fixture']['date'].replace('Z','+00:00')).astimezone(MAROUA_TZ)
-        heure_str=dt.strftime("%H:%M Maroua")
-    except:
-        heure_str=fx['fixture']['date']; dt=datetime.datetime.now(MAROUA_TZ)
-    prono_natif=pred['predictions'].get('advice','Double Chance')
-    pct=pred.get('predictions',{}).get('percent',{})
-    try: prob=int(str(pct.get('home','50')).replace('%','') or 50)
-    except: prob=50
-    odds_dict, markets_text = get_all_pinnacle_odds(match_obj['fid'])
-    odds_str=", ".join([f"{k}:{v}" for k,v in odds_dict.items()]) if odds_dict else markets_text[:200]
-    prono_final, note_ia = arbitrage_ia(home, away, prono_natif, fx['league']['name'], markets_text, prob)
-    msg = f"🔥 *TICKET V23 FREE {index}*\n⚽️ {home} vs {away} - {heure_str}\n🏆 {fx['league']['name']}\n\n📊 NATIF: {prono_natif} ({prob}%)\n🎯 *FINAL:* {prono_final}\n💰 {odds_str}\n🧠 {note_ia}"
-    send_telegram(msg, chat_id)
-    ecrire_dans_sheet(dt.strftime("%Y-%m-%d %H:%M"), f"{home} - {away}", fx['league']['name'], prono_final, odds_str, note_ia)
-
 @app.route('/')
-def home_route(): return "SEHBA V23 FREE - ACTIF"
+def home_route(): return "SEHBA V23 FINAL PRO - ACTIF"
 @app.route('/ping')
-def ping_route(): return jsonify({"status":"alive","version":"V23 FREE","tracked":len(TRACKED_MATCHES),"date":get_today_maroua()})
+def ping_route(): return jsonify({"status":"alive","version":"V23 FINAL PRO","tracked":len(TRACKED_MATCHES),"date":get_today_maroua()})
 @app.route('/run')
 def run_daily():
     today=get_today_maroua()
@@ -172,15 +258,19 @@ def run_daily():
     load_tracked()
     matches=choisir_7_obligatoires()
     if not matches:
-        send_telegram(f"ℹ️ V23 FREE: Aucun match pour {today}. API a renvoyé 0.")
+        send_telegram(f"ℹ️ V23: Aucun match pour {today}.")
         return jsonify({"error":"0 match","date":today})
     with open(LAST_RUN_FILE,'w') as f: f.write(today)
-    msg=f"🚀 *V23 FREE - {len(TRACKED_MATCHES)} matchs SUIVI pour {today}:*\n"
-    for m in TRACKED_MATCHES:
-        dt=datetime.datetime.fromisoformat(m['heure'].replace('Z','+00:00')).astimezone(MAROUA_TZ)
-        msg+=f"- {m['home']} vs {m['away']} à {dt.strftime('%H:%M')}\n"
-    send_telegram(msg)
+    # Analyse et collect pour combinés
+    datas=[]
+    for i,m in enumerate(matches,1):
+        d=analyser_et_envoyer(m, f"AUTO-{i}")
+        datas.append(d)
+        time.sleep(2)
+    # Construit combinés facultatifs auto
+    construire_combinés_auto(datas)
     return jsonify({"status":"OK","date":today})
+
 @app.route('/check_and_analyze')
 def check_and_analyze():
     load_tracked()
@@ -214,52 +304,30 @@ def webhook_route():
     if ' - ' in clean: sep=' - '
     elif ' vs ' in lower:
         idx=lower.find(' vs '); clean=clean[:idx]+' - '+clean[idx+4:]; sep=' - '
-    elif ' v ' in f" {lower} ":
-        idx=lower.find(' v '); clean=clean[:idx]+' - '+clean[idx+3:]; sep=' - '
     else: sep=None
     if not sep or ' - ' not in clean:
         send_telegram("Format: /vs Real - Leipzig", chat_id); return jsonify({"ok":True})
     h_q,a_q=[x.strip() for x in clean.split(' - ',1)]
-    send_telegram(f"🔍 *V23 FREE: {h_q} vs {a_q} (scan date gratuit)...*", chat_id)
+    send_telegram(f"🔍 *V23 FINAL: {h_q} vs {a_q}...*", chat_id)
     target=None
     for days in [0,1]:
         date_check=(datetime.datetime.now(MAROUA_TZ).date()+datetime.timedelta(days=days)).isoformat()
         fixtures=call_api(f"fixtures?date={date_check}")
-        print(f"V23 FREE scan {date_check}: {len(fixtures)} fixtures")
         for f in fixtures:
-            hn=strip_accents(f['teams']['home']['name'].lower())
-            an=strip_accents(f['teams']['away']['name'].lower())
-            if (h_q.lower() in hn and a_q.lower() in an) or (h_q.lower() in an and a_q.lower() in hn) or (h_q.lower() in hn or a_q.lower() in an or h_q.lower() in an or a_q.lower() in hn):
-                if h_q.lower() in hn or h_q.lower() in an:
-                    if a_q.lower() in hn or a_q.lower() in an:
-                        target=f; break
-                if not target and (h_q.lower() in hn or h_q.lower() in an or a_q.lower() in hn or a_q.lower() in an):
-                    target=f
-        if target and (h_q.lower() in strip_accents(target['teams']['home']['name'].lower()) or h_q.lower() in strip_accents(target['teams']['away']['name'].lower())): 
-            pass
-        if target and target['teams']['home']['name'].lower().count(h_q.lower()) or True:
-            pass
+            hn=strip_accents(f['teams']['home']['name'].lower()); an=strip_accents(f['teams']['away']['name'].lower())
+            if h_q.lower()[:4] in hn or h_q.lower()[:4] in an:
+                if a_q.lower()[:4] in hn or a_q.lower()[:4] in an:
+                    target=f; break
         if target: break
-    # version simple finale
     if not target:
-        for days in [0,1]:
-            date_check=(datetime.datetime.now(MAROUA_TZ).date()+datetime.timedelta(days=days)).isoformat()
-            fixtures=call_api(f"fixtures?date={date_check}")
-            for f in fixtures:
-                hn=strip_accents(f['teams']['home']['name'].lower()); an=strip_accents(f['teams']['away']['name'].lower())
-                if h_q.lower()[:4] in hn or h_q.lower()[:4] in an:
-                    if a_q.lower()[:4] in hn or a_q.lower()[:4] in an:
-                        target=f; break
-            if target: break
-    if not target:
-        send_telegram(f"❌ {h_q} vs {a_q} introuvable sur {get_today_maroua()}. Vérifie orthographe.", chat_id)
+        send_telegram(f"❌ {h_q} vs {a_q} introuvable.", chat_id)
         return jsonify({"ok":True})
     fid=target['fixture']['id']
     pred=call_api(f"predictions?fixture={fid}")
     if not pred:
-        send_telegram(f"⚠️ {target['teams']['home']['name']} vs {target['teams']['away']['name']} trouvé mais pas de prono API.", chat_id)
+        send_telegram(f"⚠️ {target['teams']['home']['name']} vs {target['teams']['away']['name']} trouvé mais pas de stats.", chat_id)
         return jsonify({"ok":True})
-    analyser_et_envoyer({"fid":fid,"fixture":target,"pred":pred[0]}, "MANUEL V23 FREE", chat_id)
+    analyser_et_envoyer({"fid":fid,"fixture":target,"pred":pred[0]}, "MANUEL V23 FINAL", chat_id)
     return jsonify({"ok":True})
 
 if __name__=="__main__":
